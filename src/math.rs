@@ -94,23 +94,11 @@ fn gauss_legendre(n: usize) -> (Vec<f64>, Vec<f64>) {
     golub_welsch(&a, &b, 2.0)
 }
 
-fn gauss_hermite(n: usize) -> (Vec<f64>, Vec<f64>) {
-    let a: Vec<f64> = (1..n).map(|i| (2.0 * i as f64).sqrt()).collect();
-    let b = vec![0.0f64; n];
-    golub_welsch(&a, &b, PI.sqrt())
-}
-
-
 const LEGENDRE: usize = 300;
-const HERMITE: usize = 128;
 
 fn legendre() -> &'static (Vec<f64>, Vec<f64>) {
     static C: OnceLock<(Vec<f64>, Vec<f64>)> = OnceLock::new();
     C.get_or_init(|| gauss_legendre(LEGENDRE))
-}
-fn hermite() -> &'static (Vec<f64>, Vec<f64>) {
-    static C: OnceLock<(Vec<f64>, Vec<f64>)> = OnceLock::new();
-    C.get_or_init(|| gauss_hermite(HERMITE))
 }
 
 // ── density / cdf kernels ─────────────────────────────────────────
@@ -351,6 +339,150 @@ pub fn bf_correlation(r: f64, n: i64, r0: f64, alt: Alt) -> f64 {
     bf_ttest(t, n - 2, r0, alt)
 }
 
+/// JASP robustness-check r grid (commonbayesianttest.R, `.plotBF.robustnessCheck.ttest2`):
+///   r > 1.5  → seq(0.0005, 2.0, length.out = 535)
+///   otherwise → seq(0.0005, 1.5, length.out = 400)
+/// `points` (>= 2) overrides the length.out, keeping the same anchor/high.
+pub fn robustness_grid(r: f64, points: Option<i64>) -> Vec<f64> {
+    let (hi, n) = match points {
+        Some(p) if p >= 2 => (r.max(1.5), p as usize),
+        _ => {
+            if r > 1.5 {
+                (2.0, 535)
+            } else {
+                (1.5, 400)
+            }
+        }
+    };
+    (0..n)
+        .map(|i| 0.0005 + (hi - 0.0005) * (i as f64 / (n - 1) as f64))
+        .collect()
+}
+
+// ── Bayesian ANOVA & regression (JZS, closed-form quadrature) ─────
+// JASP ANOVA (`anovaBF`) and regression (`lmBF`) both reduce, per model, to a
+// single closed-form Bayes factor — no MCMC on the BF path (only posterior
+// sampling uses Gibbs, which we do not expose). Verified against R's
+// `oneWayAOV.Fstat` / `linearReg.R2stat` (method = "quadrature").
+//
+// Both integrals are over the precision-scaled effect g ∈ (0,∞). We work in
+// w = log(g) (dg = e^w dw, the +w below is that Jacobian) so the integrands
+// are smooth over w ∈ (−∞,∞), find the mode by golden section, then integrate
+// the mode-centered integrand on a growing window with Gauss–Legendre.
+
+/// ∫₀^∞ exp(f(w)) dw for a unimodal f given in log-space, via golden-section
+/// peak finding + windowed GL (log-sum-exp, overflow-safe since exp(f−peak)≤1).
+fn log_integrate_peak(f: &dyn Fn(f64) -> f64, lo: f64, hi: f64) -> f64 {
+    let (xs, ws) = legendre();
+    let gr = (5.0f64.sqrt() - 1.0) / 2.0;
+    // golden-section maximization of f
+    let (mut a, mut b) = (lo, hi);
+    let mut c = b - gr * (b - a);
+    let mut d = a + gr * (b - a);
+    let (mut fc, mut fd) = (f(c), f(d));
+    for _ in 0..200 {
+        if (b - a).abs() < 1e-9 {
+            break;
+        }
+        if fc > fd {
+            b = d;
+            d = c;
+            fd = fc;
+            c = b - gr * (b - a);
+            fc = f(c);
+        } else {
+            a = c;
+            c = d;
+            fc = fd;
+            d = a + gr * (b - a);
+            fd = f(d);
+        }
+    }
+    let peak = 0.5 * (a + b);
+    let peakv = f(peak);
+    // grow window until both endpoints are far below the peak
+    let mut W = 6.0;
+    for _ in 0..14 {
+        if f(peak + W) < peakv - 40.0 && f(peak - W) < peakv - 40.0 {
+            break;
+        }
+        W *= 1.6;
+    }
+    let l = peak - W;
+    let h = peak + W;
+    let half = 0.5 * (h - l);
+    let mid = 0.5 * (l + h);
+    let mut s = 0.0f64;
+    for i in 0..xs.len() {
+        s += ws[i] * (f(mid + half * xs[i]) - peakv).exp();
+    }
+    let scaled = s * half; // ∫ exp(f − peak) over window
+    if scaled <= 0.0 || !scaled.is_finite() {
+        return f64::NEG_INFINITY;
+    }
+    peakv + scaled.ln()
+}
+
+/// One-way ANOVA log-integrand in w = log(g) space (JASP `marginal.g.oneWay`).
+/// `n` = per-group sample size, `k` = number of groups, `F` = ANOVA F-statistic.
+fn anova_integrand_w(w: f64, F: f64, n: f64, k: f64, rscale: f64) -> f64 {
+    let g = w.exp();
+    let dfs = (k - 1.0) / (n * k - k);
+    let omega = (1.0 + n * g / (dfs * F + 1.0)) / (n * g + 1.0);
+    let logi = rscale.ln()
+        - 0.5 * (2.0 * PI).ln()
+        - 1.5 * w
+        - rscale * rscale / (2.0 * g)
+        - 0.5 * (k - 1.0) * (n * g + 1.0).ln()
+        - 0.5 * (n * k - 1.0) * omega.ln();
+    logi + w // Jacobian dg/dw = e^w
+}
+
+/// One-way ANOVA BF10 for `k` groups of `n` observations, ANOVA statistic `F`,
+/// Cauchy prior scale `rscale` (JASP allNways fixed: medium=0.5, wide=√2/2,
+/// ultrawide=1.0).
+pub fn bf_anova(F: f64, n: i64, k: i64, rscale: f64) -> f64 {
+    if n < 2 || k < 2 || rscale <= 0.0 || F < 0.0 || !F.is_finite() {
+        return f64::NAN;
+    }
+    let (n, k) = (n as f64, k as f64);
+    let logbf = log_integrate_peak(
+        &|w| anova_integrand_w(w, F, n, k, rscale),
+        -25.0,
+        25.0,
+    );
+    logbf.exp()
+}
+
+/// Regression log-integrand in w = log(g) space (JASP `integrand.regression`,
+/// written with the g→e^w substitution). `N` = #observations, `p` = #predictors,
+/// `R2` = R² of the full model.
+fn reg_integrand_w(w: f64, N: f64, p: f64, r2: f64, rscale: f64) -> f64 {
+    let g = w.exp();
+    let scale = rscale * rscale * N / 2.0;
+    // dinvgamma(g; shape=1/2, scale) = scale^0.5/Γ(0.5) · g^{-3/2} · e^{-scale/g}
+    //   log = 0.5·log(scale) − 0.5·log π − 1.5·log(g) − scale/g
+    let log_igamma = 0.5 * scale.ln() - 0.5 * PI.ln() - 1.5 * w - scale / g;
+    let a = 0.5 * ((N - p - 1.0) * (1.0 + g).ln() - (N - 1.0) * (1.0 + g * (1.0 - r2)).ln());
+    a + log_igamma + w // Jacobian dg/dw = e^w
+}
+
+/// Regression BF10 for model with `p` predictors, `N` observations, full-model
+/// R², Cauchy prior scale `rscale` (JASP regression: medium=√2/4, wide=0.5,
+/// ultrawide=√2/2).
+pub fn bf_regression(N: i64, p: i64, r2: f64, rscale: f64) -> f64 {
+    if N < p + 2 || p < 1 || r2 < 0.0 || r2 >= 1.0 || rscale <= 0.0 || !r2.is_finite() {
+        return f64::NAN;
+    }
+    let (N, p) = (N as f64, p as f64);
+    let logbf = log_integrate_peak(
+        &|w| reg_integrand_w(w, N, p, r2, rscale),
+        -25.0,
+        25.0,
+    );
+    logbf.exp()
+}
+
 // ── self-tests (run with `cargo test`) ────────────────────────────
 // Parse the JASP reference CSVs in test/fixtures/ (produced by running
 // JASP's own informedbayesianttestfunctions.R under Windows R) and assert
@@ -468,5 +600,71 @@ mod tests {
             let got = bf_ttest(*t, *n, 0.707, *alt);
             assert!(close(got, *exp), "one-sided t={t} n={n} {alt:?}: got {got}, want {exp}");
         }
+    }
+
+    fn unquote(s: &str) -> &str {
+        s.trim_matches('"')
+    }
+    fn rscale(s: &str) -> f64 {
+        match s {
+            "medium" => 0.5,
+            "wide" => (2.0f64).sqrt() / 2.0,
+            "ultrawide" => 1.0,
+            _ => panic!("unknown rscale {s}"),
+        }
+    }
+
+    #[test]
+    fn bf_anova_matches_r() {
+        // Reference: R BayesFactor:::oneWayAOV.Fstat(F, N=per-group n, J=#groups)
+        // over F∈{0..12}, N∈{5..40}, J∈{2..6}, all 3 JASP prior widths (432 rows),
+        // and cross-checked against full BayesFactor::anovaBF on synthetic data.
+        let rows = lines("test/fixtures/anova_ref.csv");
+        let mut checked = 0usize;
+        for l in rows.iter().skip(1) {
+            let f: Vec<&str> = l.split(',').map(unquote).collect();
+            if f.len() != 5 {
+                continue;
+            }
+            let F: f64 = f[0].parse().unwrap();
+            let n: i64 = f[1].parse().unwrap();
+            let k: i64 = f[2].parse().unwrap();
+            let r = rscale(f[3]);
+            let val: f64 = f[4].parse().unwrap();
+            let got = bf_anova(F, n, k, r);
+            assert!(close(got, val), "bf_anova({F},{n},{k},{r}) = {got}, R says {val}");
+            checked += 1;
+        }
+        assert!(checked == 432, "only {checked} anova rows checked");
+    }
+
+    #[test]
+    fn bf_regression_matches_r() {
+        // Reference: R BayesFactor:::linearReg.R2stat(N, p, R2, rscale) over
+        // N∈{10..100}, p∈{1..5}, R2∈{0..0.8}, all 3 JASP regression prior
+        // widths (288 rows), cross-checked against full BayesFactor::lmBF.
+        let rows = lines("test/fixtures/reg_ref.csv");
+        let mut checked = 0usize;
+        for l in rows.iter().skip(1) {
+            let f: Vec<&str> = l.split(',').map(unquote).collect();
+            if f.len() != 5 {
+                continue;
+            }
+            let N: i64 = f[0].parse().unwrap();
+            let p: i64 = f[1].parse().unwrap();
+            let r2: f64 = f[2].parse().unwrap();
+            // regression rscale map: medium=sqrt(2)/4, wide=0.5, ultrawide=sqrt(2)/2
+            let r = match f[3] {
+                "medium" => (2.0f64).sqrt() / 4.0,
+                "wide" => 0.5,
+                "ultrawide" => (2.0f64).sqrt() / 2.0,
+                _ => panic!("unknown rscale {}", f[3]),
+            };
+            let val: f64 = f[4].parse().unwrap();
+            let got = bf_regression(N, p, r2, r);
+            assert!(close(got, val), "bf_regression({N},{p},{r2},{r}) = {got}, R says {val}");
+            checked += 1;
+        }
+        assert!(checked == 288, "only {checked} regression rows checked");
     }
 }

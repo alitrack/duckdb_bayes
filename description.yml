@@ -1,6 +1,6 @@
 extension:
   name: bayes_ext
-  description: Read JASP project files (.jasp) as SQL tables — data, column metadata and analysis registry
+  description: "BayesFactor / JASP-compatible Bayesian analyses - t-test, ANOVA, regression BF10 (JZS/Zellner, JASP default Cauchy priors)"
   version: 0.1.0
   language: Rust
   build: cargo

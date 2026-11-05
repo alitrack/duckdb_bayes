@@ -178,6 +178,164 @@ unsafe extern "C" fn bf_regression_fn(
     }
 }
 
+// ── Bayesian binomial / multinomial / contingency / equivalence ──
+// jaspFrequencies + jaspEquivalenceTTests. Math in math.rs, ported from JASP
+// R + the BayesFactor 0.9.12 closed forms (Gunel-Dickey 1974 for contingency).
+
+unsafe extern "C" fn bf_binomial_fn(
+    _info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let n = usize::try_from(unsafe { duckdb_data_chunk_get_size(input) }).unwrap_or(0);
+    let rk = unsafe { VectorReader::new(input, 0) }; // k  successes BIGINT
+    let rn = unsafe { VectorReader::new(input, 1) }; // n  trials     BIGINT
+    let rt = unsafe { VectorReader::new(input, 2) }; // theta0         DOUBLE
+    let ra = unsafe { VectorReader::new(input, 3) }; // priorA         DOUBLE
+    let rb = unsafe { VectorReader::new(input, 4) }; // priorB         DOUBLE
+    let mut out = unsafe { VectorWriter::new(output) };
+    for i in 0..n {
+        if !unsafe { rk.is_valid(i) } || !unsafe { rn.is_valid(i) } || !unsafe { rt.is_valid(i) }
+            || !unsafe { ra.is_valid(i) } || !unsafe { rb.is_valid(i) }
+        {
+            unsafe { out.set_null(i) };
+            continue;
+        }
+        let k = unsafe { rk.read_i64(i) };
+        let nobs = unsafe { rn.read_i64(i) };
+        let theta0 = unsafe { rt.read_f64(i) };
+        let a = unsafe { ra.read_f64(i) };
+        let b = unsafe { rb.read_f64(i) };
+        let bf = math::bf_binomial_two(k, nobs, theta0, a, b);
+        if bf.is_finite() && bf > 0.0 {
+            unsafe { out.write_f64(i, bf) }
+        } else {
+            unsafe { out.set_null(i) }
+        }
+    }
+}
+
+unsafe extern "C" fn bf_multinomial_fn(
+    _info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let n = usize::try_from(unsafe { duckdb_data_chunk_get_size(input) }).unwrap_or(0);
+    let rc = unsafe { VectorReader::new(input, 0) }; // counts  VARCHAR (comma-joined)
+    let rp = unsafe { VectorReader::new(input, 1) }; // priors  VARCHAR
+    let rt = unsafe { VectorReader::new(input, 2) }; // thetas  VARCHAR
+    let mut out = unsafe { VectorWriter::new(output) };
+    for i in 0..n {
+        if !unsafe { rc.is_valid(i) } || !unsafe { rp.is_valid(i) } || !unsafe { rt.is_valid(i) } {
+            unsafe { out.set_null(i) };
+            continue;
+        }
+        let counts: Vec<i64> = parse_i64_list(unsafe { rc.read_str(i) });
+        let priors: Vec<f64> = parse_f64_list(unsafe { rp.read_str(i) });
+        let thetas: Vec<f64> = parse_f64_list(unsafe { rt.read_str(i) });
+        let bf = math::bf_multinomial(&counts, &priors, &thetas);
+        if bf.is_finite() && bf > 0.0 {
+            unsafe { out.write_f64(i, bf) }
+        } else {
+            unsafe { out.set_null(i) }
+        }
+    }
+}
+
+unsafe extern "C" fn bf_contingency_fn(
+    _info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let n = usize::try_from(unsafe { duckdb_data_chunk_get_size(input) }).unwrap_or(0);
+    let rc = unsafe { VectorReader::new(input, 0) }; // cells  VARCHAR (comma-joined)
+    let rr = unsafe { VectorReader::new(input, 1) }; // rows   BIGINT
+    let rk = unsafe { VectorReader::new(input, 2) }; // cols   BIGINT
+    let rm = unsafe { VectorReader::new(input, 3) }; // sample VARCHAR
+    let rl = unsafe { VectorReader::new(input, 4) }; // fixed  VARCHAR
+    let ra = unsafe { VectorReader::new(input, 5) }; // a      DOUBLE
+    let mut out = unsafe { VectorWriter::new(output) };
+    for i in 0..n {
+        if !unsafe { rc.is_valid(i) } || !unsafe { rr.is_valid(i) } || !unsafe { rk.is_valid(i) }
+            || !unsafe { rm.is_valid(i) } || !unsafe { rl.is_valid(i) } || !unsafe { ra.is_valid(i) }
+        {
+            unsafe { out.set_null(i) };
+            continue;
+        }
+        let cells: Vec<i64> = parse_i64_list(unsafe { rc.read_str(i) });
+        let nrows = unsafe { rr.read_i64(i) };
+        let ncols = unsafe { rk.read_i64(i) };
+        let sample = sample_type_from(unsafe { rm.read_str(i) });
+        let fixed_s = unsafe { rl.read_str(i) }.trim().to_lowercase();
+        let fixed: Option<&str> = if fixed_s.is_empty() { None } else { Some(fixed_s.as_str()) };
+        let a = unsafe { ra.read_f64(i) };
+        let logbf = math::bf_contingency_log(&cells, nrows as usize, ncols as usize, sample, fixed, a);
+        let bf = logbf.exp();
+        if bf.is_finite() && bf > 0.0 {
+            unsafe { out.write_f64(i, bf) }
+        } else {
+            unsafe { out.set_null(i) }
+        }
+    }
+}
+
+unsafe extern "C" fn bf_equivalence_fn(
+    _info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let n = usize::try_from(unsafe { duckdb_data_chunk_get_size(input) }).unwrap_or(0);
+    let rt = unsafe { VectorReader::new(input, 0) }; // t     DOUBLE
+    let rn1 = unsafe { VectorReader::new(input, 1) }; // n1    BIGINT
+    let rn2 = unsafe { VectorReader::new(input, 2) }; // n2    BIGINT (0 = one-sample)
+    let rl = unsafe { VectorReader::new(input, 3) }; // lower DOUBLE (std. units)
+    let ru = unsafe { VectorReader::new(input, 4) }; // upper DOUBLE
+    let rr = unsafe { VectorReader::new(input, 5) }; // rscale DOUBLE (JZS Cauchy scale)
+    let ra = unsafe { VectorReader::new(input, 6) }; // alt   VARCHAR
+    let mut out = unsafe { VectorWriter::new(output) };
+    for i in 0..n {
+        if !(0..7).all(|c| unsafe { VectorReader::new(input, c).is_valid(i) }) {
+            unsafe { out.set_null(i) };
+            continue;
+        }
+        let t = unsafe { rt.read_f64(i) };
+        let n1 = unsafe { rn1.read_i64(i) };
+        let n2 = unsafe { rn2.read_i64(i) };
+        let lower = unsafe { rl.read_f64(i) };
+        let upper = unsafe { ru.read_f64(i) };
+        let rscale = unsafe { rr.read_f64(i) };
+        let alt = alt_from(unsafe { ra.read_str(i) });
+        // JASP default prior: Cauchy(location 0, scale rscale, df 1).
+        let (be, _bn) = math::bf_equivalence(t, n1, n2, lower, upper, rscale, 0.0, rscale, 1.0, alt);
+        if be.is_finite() {
+            // return equivalence BF (BF for H_eq); non-equivalence as a second
+            // column would need a table fn — keep the primary equivalence BF.
+            unsafe { out.write_f64(i, be) }
+        } else {
+            unsafe { out.set_null(i) }
+        }
+    }
+}
+
+/// Parse "1,2,3" → [1,2,3] (tolerant of spaces/empties).
+fn parse_i64_list(s: &str) -> Vec<i64> {
+    s.split(',').filter_map(|x| x.trim().parse::<i64>().ok()).collect()
+}
+fn parse_f64_list(s: &str) -> Vec<f64> {
+    s.split(',').filter_map(|x| x.trim().parse::<f64>().ok()).collect()
+}
+
+/// JASP/BayesFactor sampling-plan word → math::SampleType.
+fn sample_type_from(s: &str) -> math::SampleType {
+    match s.trim().to_lowercase().as_str() {
+        "poisson" => math::SampleType::Poisson,
+        "jointmulti" => math::SampleType::JointMulti,
+        "indepmulti" | "independent" | "indep" => math::SampleType::IndepMulti,
+        "hypergeom" | "hypergeometric" => math::SampleType::HyperGeom,
+        _ => math::SampleType::Poisson,
+    }
+}
+
 // ── 3. bf_robustness_curve (table function) ───────────────────────
 // JASP "BF robustness check": BF10 as a function of the Cauchy prior scale r,
 // over JASP's default grid (see math::robustness_grid).
@@ -376,6 +534,47 @@ fn register_all(reg: &impl Registrar) -> Result<(), ExtensionError> {
                 .param(TypeId::Varchar) // prior
                 .returns(TypeId::Double)
                 .function(bf_regression_fn),
+        )?;
+        reg.register_scalar(
+            ScalarFunctionBuilder::new("bf_binomial")
+                .param(TypeId::BigInt) // k  successes
+                .param(TypeId::BigInt) // n  trials
+                .param(TypeId::Double) // theta0
+                .param(TypeId::Double) // priorA
+                .param(TypeId::Double) // priorB
+                .returns(TypeId::Double)
+                .function(bf_binomial_fn),
+        )?;
+        reg.register_scalar(
+            ScalarFunctionBuilder::new("bf_multinomial")
+                .param(TypeId::Varchar) // counts
+                .param(TypeId::Varchar) // priors
+                .param(TypeId::Varchar) // thetas
+                .returns(TypeId::Double)
+                .function(bf_multinomial_fn),
+        )?;
+        reg.register_scalar(
+            ScalarFunctionBuilder::new("bf_contingency")
+                .param(TypeId::Varchar) // cells
+                .param(TypeId::BigInt) // rows
+                .param(TypeId::BigInt) // cols
+                .param(TypeId::Varchar) // sample
+                .param(TypeId::Varchar) // fixed
+                .param(TypeId::Double) // a
+                .returns(TypeId::Double)
+                .function(bf_contingency_fn),
+        )?;
+        reg.register_scalar(
+            ScalarFunctionBuilder::new("bf_equivalence")
+                .param(TypeId::Double) // t
+                .param(TypeId::BigInt) // n1
+                .param(TypeId::BigInt) // n2 (0 = one-sample)
+                .param(TypeId::Double) // lower
+                .param(TypeId::Double) // upper
+                .param(TypeId::Double) // rscale
+                .param(TypeId::Varchar) // alt
+                .returns(TypeId::Double)
+                .function(bf_equivalence_fn),
         )?;
         reg.register_table(build_robustness_curve()?)?;
         reg.register_table(build_robustness_curve2()?)?;
